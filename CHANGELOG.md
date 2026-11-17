@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-17)
 
 Privacy fixes from a security read on 2026-11-17. Raised by Captive Origins (K task and decision: see the pull request).
 
