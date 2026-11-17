@@ -38,6 +38,12 @@ export type AgeGateOptions = {
 }
 
 const COOKIE = 'age-gate'
+
+/** Every entry point that signs or checks a cookie refuses a missing or short secret, not only `ageGate()`. */
+function assertSecret(secret: unknown): asserts secret is string {
+  if (typeof secret !== 'string' || secret.length < 32) throw new Error('age-gate: `secret` must be at least 32 characters.')
+}
+
 const sig = (secret: string, value: string) => createHmac('sha256', `age-gate:${secret}`).update(value).digest('base64url')
 
 /**
@@ -46,7 +52,10 @@ const sig = (secret: string, value: string) => createHmac('sha256', `age-gate:${
  * rounded up to the next January, never down, so nobody is let back early and no birth month sits in the cookie.
  */
 export function blockCookie(secret: string, allowedFrom: string, secure = true): string {
-  const year = coarsen(allowedFrom).slice(0, 4)
+  assertSecret(secret)
+  const until = coarsen(allowedFrom)
+  if (!until) throw new Error('age-gate: allowedFrom must be YYYY-MM.')
+  const year = until.slice(0, 4)
   const value = `${year}.${sig(secret, year)}`
   return `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 400}${secure ? '; Secure' : ''}`
 }
@@ -58,16 +67,27 @@ export function blockCookie(secret: string, allowedFrom: string, secure = true):
  * are checked again whatever the cookie says.
  */
 export function blockedUntil(secret: string, cookieHeader: string | null | undefined, now = new Date()): string | null {
-  const raw = new RegExp(`(?:^|;\\s*)${COOKIE}=([^;]+)`).exec(cookieHeader ?? '')?.[1]
-  if (!raw) return null
-  const [value, mac, ...rest] = raw.split('.')
-  if (!value || !mac || rest.length || !/^\d{4}(-(0[1-9]|1[0-2]))?$/.test(value)) return null
-  const expected = Buffer.from(sig(secret, value))
-  const got = Buffer.from(mac)
-  if (expected.length !== got.length || !timingSafeEqual(expected, got)) return null
-  const until = coarsen(value.length === 4 ? `${value}-01` : value)
+  return readBlock(secret, cookieHeader, now)?.until ?? null
+}
+
+/**
+ * Every `age-gate` cookie in the header is checked and the latest valid one wins, so sending an old one beside a newer
+ * one doesn't get round the block. `month` is true when that cookie is in the old month format, so it can be replaced.
+ */
+function readBlock(secret: string, cookieHeader: string | null | undefined, now: Date): { until: string; month: boolean } | null {
+  assertSecret(secret)
   const nowYm = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`
-  return nowYm < until ? until : null
+  let best: { until: string; month: boolean } | null = null
+  for (const match of (cookieHeader ?? '').matchAll(new RegExp(`(?:^|;\\s*)${COOKIE}=([^;]+)`, 'g'))) {
+    const [value, mac, ...rest] = match[1]!.split('.')
+    if (!value || !mac || rest.length || !/^\d{4}(-(0[1-9]|1[0-2]))?$/.test(value)) continue
+    const expected = Buffer.from(sig(secret, value))
+    const got = Buffer.from(mac)
+    if (expected.length !== got.length || !timingSafeEqual(expected, got)) continue
+    const until = coarsen(value)!
+    if (nowYm < until && (!best || until > best.until)) best = { until, month: value.length > 4 }
+  }
+  return best
 }
 
 export type SignupAnswers = { country?: unknown; region?: unknown; birthYear?: unknown; birthMonth?: unknown }
@@ -84,9 +104,11 @@ export type AgeGateCheckResult = { refuse?: string; setCookies?: string[]; flag?
  * your own form should too.
  */
 export function ageGateCheck(opts: Pick<AgeGateOptions, 'ages' | 'minimumAge' | 'secret'>) {
+  assertSecret(opts.secret)
   return ({ answers, req }: { answers?: SignupAnswers; req: Pick<PayloadRequest, 'headers'> }): AgeGateCheckResult => {
-    const blocked = blockedUntil(opts.secret, req.headers.get('cookie'))
-    if (blocked) return { refuse: tooYoungMessage(blocked) }
+    const blocked = readBlock(opts.secret, req.headers.get('cookie'), new Date())
+    // An old cookie that holds a month is swapped for a year-only one, so the month doesn't stay on a shared device.
+    if (blocked) return { refuse: tooYoungMessage(blocked.until), ...(blocked.month ? { setCookies: [blockCookie(opts.secret, blocked.until)] } : {}) }
     const a = answers ?? {}
     const result: AgeResult = ageCheck({
       country: String(a.country ?? ''),
@@ -109,6 +131,9 @@ export function ageGateCheck(opts: Pick<AgeGateOptions, 'ages' | 'minimumAge' | 
 const monthName = (ym: string) => new Date(`${ym}-01T00:00:00Z`).toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
 export const tooYoungMessage = (allowedFrom: string) => `Thanks for your interest! You can sign up from ${monthName(allowedFrom)}.`
 
+const validYearMonth = (v: unknown) => (v == null || v === '' || coarsen(String(v)) ? true : 'Use YYYY-MM.')
+const toJanuary = ({ value }: { value?: unknown }) => (typeof value === 'string' && value ? (coarsen(value) ?? value) : value)
+
 /** The fields added to the users collection. Nobody can change them through the API except `canSetMinor`. */
 function fields(opts: AgeGateOptions): Field[] {
   // Only an exact `true` from `canSetMinor` makes staff; a truthy value or a thrown error is a no, and a
@@ -124,12 +149,16 @@ function fields(opts: AgeGateOptions): Field[] {
       type: 'text',
       index: true,
       access: { read: selfOrStaff as never, create: staff, update: staff },
-      validate: (v: unknown) => (v == null || v === '' || /^\d{4}-(0[1-9]|1[0-2])$/.test(String(v)) ? true : 'Use YYYY-MM.'),
-      admin: { position: 'sidebar', description: 'Set at sign-up from the age check, or by staff for safety. Empty: an adult.' },
+      validate: validYearMonth,
+      // Whoever writes it, staff or a host, it is stored as a January: a month given is rounded up, never down.
+      hooks: { beforeChange: [toJanuary] },
+      admin: { position: 'sidebar', description: 'Set at sign-up from the age check, or by staff for safety. Always a January: a month is rounded up to the next one. Empty: an adult.' },
     },
     {
       name: 'minorCap',
       type: 'text',
+      validate: validYearMonth,
+      hooks: { beforeChange: [toJanuary] },
       access: { create: staff, update: staff, read: staff },
       admin: { hidden: true },
     },
@@ -146,18 +175,21 @@ function adultEndpoint(opts: AgeGateOptions, users: string): Endpoint {
       const body = (await req.json?.().catch(() => null)) as { adult?: unknown } | null
       const me = (await req.payload.findByID({ collection: users as never, id: req.user.id, depth: 0, overrideAccess: true, req, showHiddenFields: true })) as unknown as { minorUntil?: string | null; minorCap?: string | null }
       if (!me.minorUntil) return Response.json({ adult: true })
-      // Only asked once the date has come.
-      if (isMinor(me.minorUntil)) return Response.json({ errors: [{ message: 'Not yet.' }] }, { status: 400 })
-      if (body?.adult === true) {
-        await req.payload.update({ collection: users as never, id: req.user.id, data: { minorUntil: null, minorCap: null } as never, overrideAccess: true, req, context: { ageGate: true } })
-        await opts.onEvent?.({ type: 'minor-cleared', user: String(req.user.id), from: me.minorUntil, to: null, by: 'self', req })
-        return Response.json({ adult: true })
-      }
-      // "No, not yet": a year later, never past the cap; at the cap they're an adult by every place's rule.
-      const cap = me.minorCap ?? me.minorUntil
-      const next = me.minorUntil >= cap ? null : askAgainUntil(me.minorUntil, cap)
-      await req.payload.update({ collection: users as never, id: req.user.id, data: { minorUntil: next, ...(next ? {} : { minorCap: null }) } as never, overrideAccess: true, req, context: { ageGate: true } })
-      await opts.onEvent?.({ type: next ? 'asked-again' : 'minor-cleared', user: String(req.user.id), from: me.minorUntil, to: next, by: next ? 'self' : 'system', req })
+      // Only rounded values are used and leave here, for the field, the response and the audit (age-gate#2 review).
+      const until = coarsen(me.minorUntil)
+      // An unreadable value is left for staff: the account stays a minor rather than be guessed an adult.
+      if (!until) return Response.json({ errors: [{ message: 'Please ask the site to check your account.' }] }, { status: 409 })
+      // Only asked once the date has come: for an old account, the January its month rounds up to.
+      if (isMinor(until)) return Response.json({ errors: [{ message: 'Not yet.' }] }, { status: 400 })
+      const cap = coarsen(me.minorCap) ?? until
+      const adultNow = body?.adult === true
+      const next = adultNow || until >= cap ? null : askAgainUntil(until, cap)
+      // The change and its audit entry commit together. If the audit fails, nothing changes and the account stays a minor.
+      await inTransaction(req, async () => {
+        await req.payload.update({ collection: users as never, id: req.user!.id, data: { minorUntil: next, minorCap: next ? cap : null } as never, overrideAccess: true, req, context: { ageGate: true } })
+        await opts.onEvent?.({ type: next ? 'asked-again' : 'minor-cleared', user: String(req.user!.id), from: until, to: next, by: adultNow || next ? 'self' : 'system', req })
+      })
+      if (adultNow) return Response.json({ adult: true })
       return Response.json({ adult: !next, minorUntil: next })
     },
   }
@@ -172,7 +204,7 @@ export const ageGate =
   (opts: AgeGateOptions): Plugin =>
   (config: Config): Config => {
     const users = opts.users ?? 'users'
-    if (!opts.secret || opts.secret.length < 32) throw new Error('age-gate: `secret` must be at least 32 characters.')
+    assertSecret(opts.secret)
     const found = (config.collections ?? []).some((c) => c.slug === users)
     if (!found) throw new Error(`age-gate: no "${users}" collection.`)
     return {
@@ -190,8 +222,12 @@ export const ageGate =
               // Staff changes are logged; the plugin's own changes log themselves.
               async ({ doc, previousDoc, operation, req, context }) => {
                 if (context?.ageGate || operation !== 'update' || doc.minorUntil === previousDoc?.minorUntil) return doc
-                const type = doc.minorUntil ? 'minor-set' : 'minor-cleared'
-                await opts.onEvent?.({ type, user: String(doc.id), from: previousDoc?.minorUntil ?? null, to: doc.minorUntil ?? null, by: req.user ? 'staff' : 'system', req })
+                const from = coarsen(previousDoc?.minorUntil) ?? null
+                const to = doc.minorUntil ?? null
+                // Rounding an old month up to its January is the plugin's own doing, whoever saved the account.
+                if (from === to) return doc
+                const type = to ? 'minor-set' : 'minor-cleared'
+                await opts.onEvent?.({ type, user: String(doc.id), from, to, by: req.user ? 'staff' : 'system', req })
                 return doc
               },
             ],
@@ -211,18 +247,79 @@ export const ageGate =
 export async function applyAgeGate(payload: import('payload').Payload, args: { userId: string | number; userData?: { minorUntil?: string; minorCap?: string } | null; req?: PayloadRequest }) {
   const d = args.userData
   if (!d?.minorUntil) return
-  const ok = (v?: string) => Boolean(v && /^\d{4}-(0[1-9]|1[0-2])$/.test(v))
-  if (!ok(d.minorUntil) || (d.minorCap && !ok(d.minorCap))) throw new APIError('age-gate: minorUntil and minorCap must be YYYY-MM.', 500)
+  const minorUntil = coarsen(d.minorUntil)
+  const minorCap = d.minorCap ? coarsen(d.minorCap) : minorUntil
+  if (!minorUntil || !minorCap) throw new APIError('age-gate: minorUntil and minorCap must be YYYY-MM.', 500)
   const users = (payload.config.custom?.ageGate as { users?: string } | undefined)?.users ?? 'users'
   const onEvent = (payload.config.custom?.ageGateOnEvent as AgeGateOptions['onEvent']) ?? undefined
-  // With no `req` the plugin makes its own and opens a transaction on it, so the update and the host's `onEvent` (its
-  // audit entry) commit together or not at all. With a `req`, the caller owns the transaction and this joins it.
-  const own = !args.req
+  const data = { minorUntil, minorCap: minorCap > minorUntil ? minorCap : minorUntil }
   const req = args.req ?? ((await createLocalReq({}, payload)) as PayloadRequest)
-  const started = own ? await initTransaction(req) : false
+  // The update and the host's `onEvent` (its audit entry) commit together. A `req` that already has a transaction
+  // keeps it, and its owner commits; otherwise the plugin opens one, with or without a `req` (age-gate#2 review).
+  const started = await initTransaction(req)
   try {
-    await payload.update({ collection: users as never, id: args.userId, data: { minorUntil: d.minorUntil, minorCap: d.minorCap ?? d.minorUntil } as never, overrideAccess: true, req, context: { ageGate: true } })
-    if (onEvent) await onEvent({ type: 'minor-set', user: String(args.userId), from: null, to: d.minorUntil, by: 'signup', req })
+    await payload.update({ collection: users as never, id: args.userId, data: data as never, overrideAccess: true, req, context: { ageGate: true } })
+    if (onEvent) await onEvent({ type: 'minor-set', user: String(args.userId), from: null, to: minorUntil, by: 'signup', req })
+    if (started) await commitTransaction(req)
+  } catch (e) {
+    if (!started) throw e
+    await killTransaction(req)
+    // Fail closed: the account already exists, so rolling back alone would leave it with no flag, which reads as an
+    // adult. Write the flag again outside the transaction, then report the failure. A minor without an audit entry
+    // is better than a child who passes as an adult. When the caller owns the transaction, rolling back the account
+    // with it is the caller's to do (see the README).
+    try {
+      await payload.update({ collection: users as never, id: args.userId, data: data as never, overrideAccess: true, req: (await createLocalReq({}, payload)) as PayloadRequest, context: { ageGate: true } })
+    } catch (again) {
+      throw new AggregateError([e, again], 'age-gate: the audit failed and the minor flag could not be written; disable this account.')
+    }
+    throw e
+  }
+}
+
+/**
+ * Rounds every stored `minorUntil` and `minorCap` up to a January, for accounts made before 0.2.0, in one transaction.
+ * Safe to run again: values already year-only are left alone. An account with a value that can't be read is left as
+ * it is (it still reads as a minor) and listed in `unreadable` for staff to fix by hand. Rounding isn't a change of status, so it sends
+ * no `onEvent`.
+ */
+export async function coarsenStoredAges(payload: import('payload').Payload, args: { req?: PayloadRequest } = {}) {
+  const users = (payload.config.custom?.ageGate as { users?: string } | undefined)?.users ?? 'users'
+  const req = args.req ?? ((await createLocalReq({}, payload)) as PayloadRequest)
+  const started = await initTransaction(req)
+  const result = { checked: 0, changed: 0, unreadable: [] as string[] }
+  try {
+    const { docs } = await payload.find({ collection: users as never, where: { or: [{ minorUntil: { exists: true } }, { minorCap: { exists: true } }] }, pagination: false, depth: 0, overrideAccess: true, showHiddenFields: true, req, select: { minorUntil: true, minorCap: true } as never })
+    for (const doc of docs as unknown as { id: string | number; minorUntil?: string | null; minorCap?: string | null }[]) {
+      result.checked++
+      const data: Record<string, string> = {}
+      let readable = true
+      for (const key of ['minorUntil', 'minorCap'] as const) {
+        const v = doc[key]
+        if (!v) continue
+        const c = coarsen(v)
+        if (!c) readable = false
+        else if (c !== v) data[key] = c
+      }
+      // An account with a value that can't be read is left whole, for staff: the field's own check would refuse it.
+      if (!readable) result.unreadable.push(String(doc.id))
+      if (!readable || !Object.keys(data).length) continue
+      await payload.update({ collection: users as never, id: doc.id, data: data as never, overrideAccess: true, req, context: { ageGate: true } })
+      result.changed++
+    }
+    if (started) await commitTransaction(req)
+  } catch (e) {
+    if (started) await killTransaction(req)
+    throw e
+  }
+  return result
+}
+
+/** Runs `work` in the request's transaction, opening (and committing or rolling back) one if it has none. */
+async function inTransaction(req: PayloadRequest, work: () => Promise<void>) {
+  const started = await initTransaction(req)
+  try {
+    await work()
     if (started) await commitTransaction(req)
   } catch (e) {
     if (started) await killTransaction(req)

@@ -2,7 +2,7 @@ import { createHmac } from 'node:crypto'
 
 import { describe, expect, it } from 'vitest'
 
-import { ageCheck, askAgainUntil, blockCookie, blockedUntil, capFor, coarsen, isMinor, maxMajority, ruleFor } from '../src/index.js'
+import { ageCheck, ageGateCheck, askAgainUntil, blockCookie, blockedUntil, capFor, coarsen, isMinor, maxMajority, ruleFor } from '../src/index.js'
 
 const at = (iso: string) => new Date(`${iso}T12:00:00Z`)
 
@@ -119,6 +119,28 @@ describe('minorUntil is coarse and never early', () => {
     expect(coarsen('2028-12')).toBe('2029-01')
   })
 
+  it('coarsen is safe on anything: null, junk and a bare year, and running it twice changes nothing', () => {
+    expect(coarsen(null)).toBeNull()
+    expect(coarsen(undefined)).toBeNull()
+    expect(coarsen('')).toBeNull()
+    expect(coarsen('soon')).toBeNull()
+    expect(coarsen('2028-13')).toBeNull()
+    expect(coarsen('2028-00')).toBeNull()
+    expect(coarsen('2028')).toBe('2028-01')
+    for (const v of ['2028', '2028-01', '2028-05', '2028-12']) expect(coarsen(coarsen(v))).toBe(coarsen(v))
+  })
+
+  it('"not yet" from an account that still holds a month never writes a month back, however often it is asked', () => {
+    // An account from before 0.2.0: a month in both values (age-gate#2 review, blocker 1).
+    let until = '2032-05'
+    const cap = '2033-05'
+    for (let i = 0; i < 3; i++) {
+      until = askAgainUntil(until, cap)
+      expect(until).toMatch(/^\d{4}-01$/)
+    }
+    expect(until).toBe('2034-01') // the cap, rounded up, never down
+  })
+
   it('an older stored month still reads correctly', () => {
     expect(isMinor('2028-07', at('2028-06-30'))).toBe(true)
     expect(isMinor('2028-07', at('2028-07-01'))).toBe(false)
@@ -174,5 +196,33 @@ describe('the stay-blocked cookie', () => {
     expect(blockedUntil(secret, legacy('2027-04').replace('2027-04', '2027-05'), at('2026-11-10'))).toBeNull()
     expect(blockedUntil(secret, 'age-gate=2027-04', at('2026-11-10'))).toBeNull()
     expect(blockedUntil(secret, 'age-gate=2027-13.abc', at('2026-11-10'))).toBeNull()
+  })
+
+  it('with two cookies, the latest valid block wins, whichever comes first', () => {
+    const early = blockCookie(secret, '2025-01').split(';')[0]!
+    const late = blockCookie(secret, '2031-01').split(';')[0]!
+    expect(blockedUntil(secret, `${early}; ${late}`, at('2026-11-10'))).toBe('2031-01')
+    expect(blockedUntil(secret, `${late}; ${early}`, at('2026-11-10'))).toBe('2031-01')
+    expect(blockedUntil(secret, `age-gate=2040.forged; ${late}`, at('2026-11-10'))).toBe('2031-01')
+  })
+
+  it('refuses a missing or short secret wherever a cookie is signed or checked', () => {
+    for (const bad of [undefined, '', 'short']) {
+      expect(() => blockCookie(bad as never, '2028-01')).toThrow(/secret/)
+      expect(() => blockedUntil(bad as never, 'age-gate=2028.x')).toThrow(/secret/)
+      expect(() => ageGateCheck({ secret: bad as never })).toThrow(/secret/)
+    }
+  })
+
+  it('an old month cookie is swapped for a year cookie when it is seen', () => {
+    const now = new Date()
+    const month = `${now.getUTCFullYear() + 2}-04`
+    const result = ageGateCheck({ secret })({ answers: {}, req: { headers: new Headers({ cookie: legacy(month) }) } })
+    expect(result?.refuse).toMatch(/You can sign up from/)
+    const set = result?.setCookies?.[0] ?? ''
+    expect(set).toMatch(new RegExp(`^age-gate=${now.getUTCFullYear() + 3}\\.`))
+    expect(set).not.toMatch(/\d{4}-\d{2}/)
+    // A year cookie isn't reissued.
+    expect(ageGateCheck({ secret })({ answers: {}, req: { headers: new Headers({ cookie: set.split(';')[0]! }) } })?.setCookies).toBeUndefined()
   })
 })

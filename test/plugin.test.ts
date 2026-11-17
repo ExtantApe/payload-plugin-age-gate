@@ -1,9 +1,9 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
-import { buildConfig, createLocalReq, getPayload, handleEndpoints, type Endpoint, type Payload, type PayloadRequest } from 'payload'
+import { buildConfig, commitTransaction, createLocalReq, initTransaction, getPayload, handleEndpoints, type Endpoint, type Payload, type PayloadRequest } from 'payload'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { ageGate, ageGateCheck, applyAgeGate, type AgeGateEvent } from '../src/index.js'
+import { ageGate, ageGateCheck, applyAgeGate, coarsenStoredAges, type AgeGateEvent } from '../src/index.js'
 
 type U = { id: string; email: string; role: string; minorUntil?: string | null; minorCap?: string | null }
 let payload: Payload
@@ -28,6 +28,10 @@ const adult = async (user: U, adultAnswer: boolean) => {
   const req = await reqAs(user)
   ;(req as { json: () => Promise<unknown> }).json = async () => ({ adult: adultAnswer })
   return ep.handler(req)
+}
+/** Writes straight to the database, past the plugin's hooks: how an account from before 0.2.0 looks. */
+const legacy = async (u: U, values: Record<string, string | null>) => {
+  await (payload.db as unknown as { collections: Record<string, { updateOne: (q: object, u: object) => Promise<unknown> }> }).collections.users!.updateOne({ _id: u.id }, { $set: values })
 }
 const fresh = async (u: U) => (await payload.findByID({ collection: 'users', id: u.id, overrideAccess: true, showHiddenFields: true, depth: 0 })) as unknown as U
 
@@ -94,7 +98,7 @@ describe('the age gate on a users collection', () => {
     expect((await adult(kid, true)).status).toBe(400) // not yet
     await payload.update({ collection: 'users', id: kid.id, data: { minorUntil: '2020-01', minorCap: '2022-01' } as never, overrideAccess: true })
     expect(await (await adult(kid, false)).json()).toEqual({ adult: false, minorUntil: '2021-01' })
-    await payload.update({ collection: 'users', id: kid.id, data: { minorUntil: '2021-06' } as never, overrideAccess: true })
+    await legacy(kid, { minorUntil: '2020-06' }) // an old month: read as 2021-01, so a year on is the cap
     expect(await (await adult(kid, false)).json()).toEqual({ adult: false, minorUntil: '2022-01' })
     await payload.update({ collection: 'users', id: kid.id, data: { minorUntil: '2022-01' } as never, overrideAccess: true })
     expect(await (await adult(kid, false)).json()).toEqual({ adult: true, minorUntil: null }) // at the cap: an adult everywhere
@@ -105,21 +109,25 @@ describe('the age gate on a users collection', () => {
   })
 
   it('only the person and staff can read "minor until"; another member and a signed-out request can’t', async () => {
-    await payload.update({ collection: 'users', id: kid.id, data: { minorUntil: '2031-04' } as never, overrideAccess: true })
+    await payload.update({ collection: 'users', id: kid.id, data: { minorUntil: '2032-01' } as never, overrideAccess: true })
     const as = async (u: U | null) => (await payload.findByID({ collection: 'users', id: kid.id, depth: 0, overrideAccess: false, user: u ? ({ ...u, collection: 'users' } as never) : undefined })) as unknown as U
-    expect((await as(kid)).minorUntil).toBe('2031-04')
-    expect((await as(staff)).minorUntil).toBe('2031-04')
+    expect((await as(kid)).minorUntil).toBe('2032-01')
+    expect((await as(staff)).minorUntil).toBe('2032-01')
     expect((await as(other)).minorUntil).toBeUndefined()
     expect((await as(null)).minorUntil).toBeUndefined()
   })
 
   it('a sign-up that creates with access checks drops the flag, so applyAgeGate records it (and refuses junk)', async () => {
-    const userData = { minorUntil: '2030-05', minorCap: '2032-05' }
+    const userData = { minorUntil: '2031-01', minorCap: '2033-01' }
     const created = (await payload.create({ collection: 'users', data: { email: 'signup@example.invalid', password: 'pw-signup-long', ...userData } as never, overrideAccess: false })) as unknown as U
     expect((await fresh(created)).minorUntil ?? null).toBeNull() // dropped by field access, as the README warns
     await applyAgeGate(payload, { userId: created.id, userData, req: await reqAs(null) })
     expect(await fresh(created)).toMatchObject(userData)
-    expect(events.at(-1)).toMatchObject({ type: 'minor-set', to: '2030-05', by: 'signup' })
+    expect(events.at(-1)).toMatchObject({ type: 'minor-set', to: '2031-01', by: 'signup' })
+    // A month handed in is stored, and logged, as the next January.
+    await applyAgeGate(payload, { userId: created.id, userData: { minorUntil: '2030-05', minorCap: '2032-05' }, req: await reqAs(null) })
+    expect(await fresh(created)).toMatchObject({ minorUntil: '2031-01', minorCap: '2033-01' })
+    expect(events.at(-1)).toMatchObject({ type: 'minor-set', to: '2031-01' })
     await expect(applyAgeGate(payload, { userId: created.id, userData: { minorUntil: 'soon' } })).rejects.toThrow(/YYYY-MM/)
   })
 
@@ -141,7 +149,7 @@ describe('the age gate on a users collection', () => {
       expect(await fresh(u)).toMatchObject(userData)
     })
 
-    it('rolls the update back when the event handler fails, so a minor is never saved without its audit entry', async () => {
+    it('when the audit fails, the account still comes out a minor, never an adult, and the failure is reported', async () => {
       const u = await make('noreq-rollback')
       onEventHook = () => {
         throw new Error('audit down')
@@ -151,12 +159,13 @@ describe('the age gate on a users collection', () => {
       } finally {
         onEventHook = null
       }
-      expect((await fresh(u)).minorUntil ?? null).toBeNull()
+      expect(await fresh(u)).toMatchObject(userData) // age-gate#2 review, blocker 2: fails closed
     })
 
-    it('with a req from the host, joins the host’s transaction and leaves it to commit', async () => {
+    it('with a req from the host that has no transaction, still puts the update and the audit in one', async () => {
       const u = await make('noreq-host')
       const req = await reqAs(null)
+      expect(req.transactionID).toBeFalsy()
       let seenId: unknown
       onEventHook = (e) => void (seenId = e.req.transactionID)
       try {
@@ -164,9 +173,113 @@ describe('the age gate on a users collection', () => {
       } finally {
         onEventHook = null
       }
-      expect(seenId).toBe(req.transactionID) // the same request, nothing opened or committed by the plugin
+      expect(seenId).toBeTruthy()
       expect(await fresh(u)).toMatchObject(userData)
     })
+
+    it('with a req whose transaction the host opened, joins it and leaves the commit to the host', async () => {
+      const u = await make('host-tx')
+      const req = await reqAs(null)
+      expect(await initTransaction(req)).toBe(true)
+      const id = req.transactionID
+      let seenId: unknown
+      onEventHook = (e) => void (seenId = e.req.transactionID)
+      try {
+        await applyAgeGate(payload, { userId: u.id, userData, req })
+      } finally {
+        onEventHook = null
+      }
+      expect(seenId).toBe(id)
+      expect(req.transactionID).toBe(id) // still open: the plugin didn't commit it
+      expect((await fresh(u)).minorUntil ?? null).toBeNull() // not visible outside the host's transaction yet
+      await commitTransaction(req)
+      expect(await fresh(u)).toMatchObject(userData)
+    })
+  })
+
+  describe('accounts from before 0.2.0, which still hold a month (age-gate#2 review)', () => {
+    it('"not yet" never writes a month back to the field, the response or the audit', async () => {
+      const u = (await payload.create({ collection: 'users', data: { email: 'old-month@example.invalid', password: 'pw-old-long' } as never })) as unknown as U
+      await legacy(u, { minorUntil: '2020-05', minorCap: '2023-05' })
+      for (let i = 0; i < 4; i++) {
+        const res = (await (await adult(u, false)).json()) as { minorUntil: string | null }
+        const stored = await fresh(u)
+        for (const v of [res.minorUntil, stored.minorUntil, stored.minorCap, events.at(-1)!.from, events.at(-1)!.to]) if (v) expect(v).toMatch(/^\d{4}-01$/)
+        if (!res.minorUntil) break
+      }
+      expect((await fresh(u)).minorUntil ?? null).toBeNull() // reached the cap, rounded up: an adult everywhere
+    })
+
+    it('the audit never carries the old month, whoever changes it', async () => {
+      const u = (await payload.create({ collection: 'users', data: { email: 'old-audit@example.invalid', password: 'pw-old-long' } as never })) as unknown as U
+      await legacy(u, { minorUntil: '2031-04', minorCap: '2033-04' })
+      await payload.update({ collection: 'users', id: u.id, data: { minorUntil: '2035-01' } as never, user: { ...staff, collection: 'users' } as never, overrideAccess: false })
+      expect(events.at(-1)).toMatchObject({ type: 'minor-set', from: '2032-01', to: '2035-01', by: 'staff' })
+    })
+
+    it('saving the account for any reason rounds it to a January, and that alone sends no audit event', async () => {
+      const u = (await payload.create({ collection: 'users', data: { email: 'old-save@example.invalid', password: 'pw-old-long' } as never })) as unknown as U
+      await legacy(u, { minorUntil: '2031-04', minorCap: '2033-04' })
+      const before = events.length
+      await payload.update({ collection: 'users', id: u.id, data: { role: 'member' } as never, overrideAccess: true })
+      expect(await fresh(u)).toMatchObject({ minorUntil: '2032-01', minorCap: '2034-01' })
+      expect(events.length).toBe(before)
+    })
+
+    it('coarsenStoredAges rounds every old account in one go, is safe to run twice, and leaves unreadable values for staff', async () => {
+      const a = (await payload.create({ collection: 'users', data: { email: 'mig-a@example.invalid', password: 'pw-mig-long' } as never })) as unknown as U
+      const b = (await payload.create({ collection: 'users', data: { email: 'mig-b@example.invalid', password: 'pw-mig-long' } as never })) as unknown as U
+      await legacy(a, { minorUntil: '2030-07', minorCap: '2032-07' })
+      await legacy(b, { minorUntil: 'junk', minorCap: '2031' })
+      const first = await coarsenStoredAges(payload)
+      expect(first.changed).toBeGreaterThanOrEqual(1)
+      expect(first.unreadable).toEqual([String(b.id)])
+      expect(await fresh(a)).toMatchObject({ minorUntil: '2031-01', minorCap: '2033-01' })
+      expect(await fresh(b)).toMatchObject({ minorUntil: 'junk', minorCap: '2031' }) // left whole for staff: it still reads as a minor
+      const second = await coarsenStoredAges(payload)
+      expect(second.changed).toBe(0)
+      expect(await fresh(a)).toMatchObject({ minorUntil: '2031-01', minorCap: '2033-01' })
+      await legacy(b, { minorUntil: null, minorCap: null })
+    })
+  })
+
+  it('staff or a host writing any month stores the next January, and junk is refused', async () => {
+    await payload.update({ collection: 'users', id: other.id, data: { minorUntil: '2031-04' } as never, user: { ...staff, collection: 'users' } as never, overrideAccess: false })
+    expect((await fresh(other)).minorUntil).toBe('2032-01')
+    await payload.update({ collection: 'users', id: other.id, data: { minorUntil: '2031-07', minorCap: '2033-02' } as never, overrideAccess: true })
+    expect(await fresh(other)).toMatchObject({ minorUntil: '2032-01', minorCap: '2034-01' })
+    await expect(payload.update({ collection: 'users', id: other.id, data: { minorUntil: '2031-13' } as never, overrideAccess: true })).rejects.toThrow()
+    await payload.update({ collection: 'users', id: other.id, data: { minorUntil: null, minorCap: null } as never, overrideAccess: true })
+  })
+
+  it('"Are you an adult now?": if the audit fails, nothing changes and the account stays a minor', async () => {
+    const u = (await payload.create({ collection: 'users', data: { email: 'adult-audit@example.invalid', password: 'pw-adult-long' } as never })) as unknown as U
+    await payload.update({ collection: 'users', id: u.id, data: { minorUntil: '2020-01', minorCap: '2022-01' } as never, overrideAccess: true })
+    onEventHook = () => {
+      throw new Error('audit down')
+    }
+    try {
+      await expect(adult(u, true)).rejects.toThrow('audit down')
+      await expect(adult(u, false)).rejects.toThrow('audit down')
+    } finally {
+      onEventHook = null
+    }
+    expect(await fresh(u)).toMatchObject({ minorUntil: '2020-01', minorCap: '2022-01' })
+  })
+
+  it('a member can’t find minors by filtering or sorting on "minor until"', async () => {
+    await payload.update({ collection: 'users', id: kid.id, data: { minorUntil: '2999-01' } as never, overrideAccess: true })
+    const asOther = { overrideAccess: false, user: { ...other, collection: 'users' } as never }
+    const filtered = await payload.find({ collection: 'users', where: { minorUntil: { exists: true } }, depth: 0, ...asOther }).then((r) => r.docs.map((d) => String(d.id)), () => 'refused')
+    expect(filtered === 'refused' || !filtered.includes(String(kid.id))).toBe(true)
+    const all = await payload.find({ collection: 'users', depth: 0, pagination: false, ...asOther })
+    const asc = await payload.find({ collection: 'users', sort: 'minorUntil', depth: 0, pagination: false, ...asOther }).then((r) => r.docs.map((d) => String(d.id)), () => 'refused')
+    const desc = await payload.find({ collection: 'users', sort: '-minorUntil', depth: 0, pagination: false, ...asOther }).then((r) => r.docs.map((d) => String(d.id)), () => 'refused')
+    // Sorting must not move the minor relative to the default order (or must be refused).
+    if (asc !== 'refused' && desc !== 'refused') {
+      const ids = all.docs.map((d) => String(d.id))
+      expect({ asc: asc.indexOf(String(kid.id)), desc: desc.indexOf(String(kid.id)) }).toEqual({ asc: ids.indexOf(String(kid.id)), desc: ids.indexOf(String(kid.id)) })
+    }
   })
 
   it('refuses the adult question signed out', async () => {
@@ -211,15 +324,15 @@ describe('only an exact yes from canSetMinor (2026-11-11)', () => {
 
   it('nobody sets, clears or reads another account\'s minor status on anything but true, and a throw is a no, never an error', async () => {
     for (const [label, answer] of noes) {
-      await payload.update({ collection: 'users', id: child.id, data: { minorUntil: '2031-04', minorCap: '2033-04' } as never, overrideAccess: true })
+      await payload.update({ collection: 'users', id: child.id, data: { minorUntil: '2032-01', minorCap: '2034-01' } as never, overrideAccess: true })
       await answering(answer, async () => {
         // Field access drops a refused field without an error, so each call must resolve and change nothing.
         await expect(payload.update({ collection: 'users', id: child.id, data: { minorUntil: null, minorCap: null } as never, ...as(staff) }), label).resolves.toBeTruthy()
         await expect(payload.update({ collection: 'users', id: child.id, data: { minorUntil: null, minorCap: null } as never, ...as(child) }), label).resolves.toBeTruthy()
         const made = (await payload.create({ collection: 'users', data: { email: `made-${noes.findIndex((n) => n[0] === label)}@example.invalid`, password: 'pw-made-long', minorUntil: '2030-01', minorCap: '2030-01' } as never, ...as(staff) })) as unknown as U
         expect((await fresh(made)).minorUntil ?? null, label).toBeNull()
-        expect((await fresh(child)).minorUntil, label).toBe('2031-04')
-        expect((await fresh(child)).minorCap, label).toBe('2033-04')
+        expect((await fresh(child)).minorUntil, label).toBe('2032-01')
+        expect((await fresh(child)).minorCap, label).toBe('2034-01')
         for (const reader of [staff, other, null]) {
           const seen = (await payload.findByID({ collection: 'users', id: child.id, depth: 0, ...as(reader) })) as unknown as U
           expect(seen.minorUntil, `${label} read by ${reader?.email ?? 'signed out'}`).toBeUndefined()
@@ -227,7 +340,7 @@ describe('only an exact yes from canSetMinor (2026-11-11)', () => {
         }
         // The person still reads their own "minor until", but never the cap.
         const own = (await payload.findByID({ collection: 'users', id: child.id, depth: 0, ...as(child) })) as unknown as U
-        expect(own.minorUntil, label).toBe('2031-04')
+        expect(own.minorUntil, label).toBe('2032-01')
         expect(own.minorCap, label).toBeUndefined()
       })
     }
@@ -236,19 +349,19 @@ describe('only an exact yes from canSetMinor (2026-11-11)', () => {
       const seen = (await payload.findByID({ collection: 'users', id: child.id, depth: 0, ...as(null) })) as unknown as U
       expect(seen.minorUntil).toBeUndefined()
       await payload.update({ collection: 'users', id: child.id, data: { minorUntil: null } as never, ...as(null) })
-      expect((await fresh(child)).minorUntil).toBe('2031-04')
+      expect((await fresh(child)).minorUntil).toBe('2032-01')
     })
     // With exactly true, staff read and change both.
     await answering(() => true, async () => {
       const seen = (await payload.findByID({ collection: 'users', id: child.id, depth: 0, ...as(staff) })) as unknown as U
-      expect(seen).toMatchObject({ minorUntil: '2031-04', minorCap: '2033-04' })
-      await payload.update({ collection: 'users', id: child.id, data: { minorUntil: '2032-04' } as never, ...as(staff) })
-      expect((await fresh(child)).minorUntil).toBe('2032-04')
+      expect(seen).toMatchObject({ minorUntil: '2032-01', minorCap: '2034-01' })
+      await payload.update({ collection: 'users', id: child.id, data: { minorUntil: '2033-01' } as never, ...as(staff) })
+      expect((await fresh(child)).minorUntil).toBe('2033-01')
     })
   })
 
   it('a throw from canSetMinor answers a REST read and update without a 500', async () => {
-    await payload.update({ collection: 'users', id: child.id, data: { minorUntil: '2031-04' } as never, overrideAccess: true })
+    await payload.update({ collection: 'users', id: child.id, data: { minorUntil: '2032-01' } as never, overrideAccess: true })
     const { token } = await payload.login({ collection: 'users', data: { email: 'staff@example.invalid', password: 'pw-staff-long' } })
     const rest = (method: string, body?: unknown) =>
       handleEndpoints({
@@ -264,6 +377,6 @@ describe('only an exact yes from canSetMinor (2026-11-11)', () => {
       const write = await rest('PATCH', { minorUntil: null })
       expect(write.status).toBeLessThan(500)
     })
-    expect((await fresh(child)).minorUntil).toBe('2031-04')
+    expect((await fresh(child)).minorUntil).toBe('2032-01')
   })
 })
