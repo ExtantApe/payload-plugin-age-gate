@@ -46,9 +46,12 @@ export function ageCheck(input: AgeInput): AgeResult {
   const consent = Math.max(rule.consent, input.minimumAge ?? 13)
   // The month in which someone is certainly `age` years old: the month after their birth month, `age` years on.
   const from = (age: number) => ym(birthYear + age, birthMonth + 1)
+  // What is handed out and stored is coarser: January of the year after they reach `age`, so the birth month can't be
+  // worked back from it. It is never earlier than `from(age)`.
+  const coarse = (age: number) => `${birthYear + age + 1}-01`
   const nowYm = ym(now.getUTCFullYear(), now.getUTCMonth() + 1)
-  if (nowYm < from(consent)) return { result: 'too-young', allowedFrom: from(consent) }
-  if (nowYm < from(rule.majority)) return { result: 'minor', minorUntil: from(rule.majority) }
+  if (nowYm < from(consent)) return { result: 'too-young', allowedFrom: coarse(consent) }
+  if (nowYm < from(rule.majority)) return { result: 'minor', minorUntil: coarse(rule.majority) }
   return { result: 'adult' }
 }
 
@@ -56,12 +59,21 @@ export function ageCheck(input: AgeInput): AgeResult {
 export const isMinor = (minorUntil: string | null | undefined, now = new Date()) =>
   Boolean(minorUntil) && ym(now.getUTCFullYear(), now.getUTCMonth() + 1) < (minorUntil as string)
 
-/** The month a "no, not yet" answer moves `minorUntil` to: a year later, but never past `cap`. */
+/**
+ * Rounds a "YYYY-MM" up to the January that is on or after it. A value that is already a January stays as it is, so
+ * it is never earlier than the one it came from. Older accounts store a month; this makes theirs year-only.
+ */
+export const coarsen = (value: string): string => {
+  const [y, m] = value.split('-').map(Number) as [number, number]
+  return `${m === 1 ? y : y + 1}-01`
+}
+
+/** What a "no, not yet" answer moves `minorUntil` to: a year later (a January), but never past `cap`. */
 export const askAgainUntil = (minorUntil: string, cap: string): string => {
   const [y, m] = minorUntil.split('-').map(Number) as [number, number]
-  const next = ym(y + 1, m)
+  const next = coarsen(ym(y + 1, m))
   return next < cap ? next : cap
 }
 
-/** The latest a minor can stay one, from where they turned out to be a minor: the highest age of majority anywhere. */
-export const capFor = (birthYear: number, birthMonth: number, maxAge: number) => ym(birthYear + maxAge, birthMonth + 1)
+/** The latest a minor can stay one: January of the year after the highest age of majority anywhere. Year-only. */
+export const capFor = (birthYear: number, _birthMonth: number, maxAge: number) => `${birthYear + maxAge + 1}-01`

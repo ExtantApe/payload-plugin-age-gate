@@ -11,6 +11,7 @@ let mongo: MongoMemoryReplSet
 const SECRET = 's'.repeat(40)
 const events: AgeGateEvent[] = []
 /** When set, what `canSetMinor` answers instead of the site's rule (staff by role). */
+let onEventHook: ((e: AgeGateEvent) => unknown) | null = null
 let setMinorAnswer: (() => unknown) | null = null
 let staff: U
 let kid: U
@@ -39,7 +40,7 @@ beforeAll(async () => {
       typescript: { autoGenerate: false },
       db: mongooseAdapter({ url: mongo.getUri('agegate'), ensureIndexes: true }),
       collections: [{ slug: 'users', auth: true, access: { create: () => true, update: () => true, read: () => true }, fields: [{ name: 'role', type: 'select', options: ['staff', 'member'], defaultValue: 'member' }] }],
-      plugins: [ageGate({ secret: SECRET, canSetMinor: ((args: { req: PayloadRequest }) => (setMinorAnswer ? setMinorAnswer() : (args.req.user as unknown as U | null)?.role === 'staff')) as never, onEvent: (e) => void events.push(e) })],
+      plugins: [ageGate({ secret: SECRET, canSetMinor: ((args: { req: PayloadRequest }) => (setMinorAnswer ? setMinorAnswer() : (args.req.user as unknown as U | null)?.role === 'staff')) as never, onEvent: async (e) => { events.push(e); await onEventHook?.(e) } })],
     }),
   })
   staff = (await payload.create({ collection: 'users', data: { email: 'staff@example.invalid', password: 'pw-staff-long', role: 'staff' } as never })) as unknown as U
@@ -120,6 +121,52 @@ describe('the age gate on a users collection', () => {
     expect(await fresh(created)).toMatchObject(userData)
     expect(events.at(-1)).toMatchObject({ type: 'minor-set', to: '2030-05', by: 'signup' })
     await expect(applyAgeGate(payload, { userId: created.id, userData: { minorUntil: 'soon' } })).rejects.toThrow(/YYYY-MM/)
+  })
+
+  describe('applyAgeGate without a req', () => {
+    const make = async (n: string) => (await payload.create({ collection: 'users', data: { email: `${n}@example.invalid`, password: 'pw-noreq-long' } as never })) as unknown as U
+    const userData = { minorUntil: '2033-01', minorCap: '2035-01' }
+
+    it('makes its own request, so onEvent runs, inside a transaction', async () => {
+      const u = await make('noreq-event')
+      let seen: unknown
+      onEventHook = (e) => void (seen = e.req.transactionID)
+      try {
+        await applyAgeGate(payload, { userId: u.id, userData })
+      } finally {
+        onEventHook = null
+      }
+      expect(events.at(-1)).toMatchObject({ type: 'minor-set', user: String(u.id), to: '2033-01', by: 'signup' })
+      expect(seen).toBeTruthy() // the audit ran in the update's transaction
+      expect(await fresh(u)).toMatchObject(userData)
+    })
+
+    it('rolls the update back when the event handler fails, so a minor is never saved without its audit entry', async () => {
+      const u = await make('noreq-rollback')
+      onEventHook = () => {
+        throw new Error('audit down')
+      }
+      try {
+        await expect(applyAgeGate(payload, { userId: u.id, userData })).rejects.toThrow('audit down')
+      } finally {
+        onEventHook = null
+      }
+      expect((await fresh(u)).minorUntil ?? null).toBeNull()
+    })
+
+    it('with a req from the host, joins the host’s transaction and leaves it to commit', async () => {
+      const u = await make('noreq-host')
+      const req = await reqAs(null)
+      let seenId: unknown
+      onEventHook = (e) => void (seenId = e.req.transactionID)
+      try {
+        await applyAgeGate(payload, { userId: u.id, userData, req })
+      } finally {
+        onEventHook = null
+      }
+      expect(seenId).toBe(req.transactionID) // the same request, nothing opened or committed by the plugin
+      expect(await fresh(u)).toMatchObject(userData)
+    })
   })
 
   it('refuses the adult question signed out', async () => {

@@ -1,14 +1,14 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 
 import type { CollectionConfig, Config, Endpoint, Field, PayloadRequest, Plugin } from 'payload'
-import { APIError } from 'payload'
+import { APIError, commitTransaction, createLocalReq, initTransaction, killTransaction } from 'payload'
 
 import { isStaff } from './access.js'
 import { AGES, DEFAULT_RULE, maxMajority, ruleFor, type AgeRule } from './ages.js'
-import { ageCheck, askAgainUntil, capFor, isMinor, type AgeResult } from './check.js'
+import { ageCheck, askAgainUntil, capFor, coarsen, isMinor, type AgeResult } from './check.js'
 
 export { AGES, DEFAULT_RULE, maxMajority, ruleFor, type AgeRule } from './ages.js'
-export { ageCheck, askAgainUntil, capFor, isMinor, type AgeInput, type AgeResult } from './check.js'
+export { ageCheck, askAgainUntil, capFor, coarsen, isMinor, type AgeInput, type AgeResult } from './check.js'
 
 export type AgeGateEvent = {
   type: 'minor-set' | 'minor-cleared' | 'asked-again'
@@ -40,23 +40,34 @@ export type AgeGateOptions = {
 const COOKIE = 'age-gate'
 const sig = (secret: string, value: string) => createHmac('sha256', `age-gate:${secret}`).update(value).digest('base64url')
 
-/** A cookie that keeps a too-young visitor blocked until `allowedFrom`, so picking another year doesn't get round it. */
+/**
+ * A cookie that keeps a too-young visitor blocked, so picking another year doesn't get round it. It holds only a
+ * year: the earliest year they may come back, read as January of it. A month given (`allowedFrom` is "YYYY-MM") is
+ * rounded up to the next January, never down, so nobody is let back early and no birth month sits in the cookie.
+ */
 export function blockCookie(secret: string, allowedFrom: string, secure = true): string {
-  const value = `${allowedFrom}.${sig(secret, allowedFrom)}`
+  const year = coarsen(allowedFrom).slice(0, 4)
+  const value = `${year}.${sig(secret, year)}`
   return `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 400}${secure ? '; Secure' : ''}`
 }
 
-/** The month a blocked visitor may try again from, if a valid block cookie is present and still in force. */
+/**
+ * The January ("YYYY-01") a blocked visitor may try again from, if a valid block cookie is present and still in force.
+ * A cookie from 0.1.2 and earlier holds a month; if its signature is valid it is still honoured, rounded up to a
+ * January, and is never read back as the month. Anything unsigned, edited or unreadable is ignored: the answers given
+ * are checked again whatever the cookie says.
+ */
 export function blockedUntil(secret: string, cookieHeader: string | null | undefined, now = new Date()): string | null {
   const raw = new RegExp(`(?:^|;\\s*)${COOKIE}=([^;]+)`).exec(cookieHeader ?? '')?.[1]
   if (!raw) return null
-  const [month, mac] = raw.split('.')
-  if (!month || !mac || !/^\d{4}-\d{2}$/.test(month)) return null
-  const expected = Buffer.from(sig(secret, month))
+  const [value, mac, ...rest] = raw.split('.')
+  if (!value || !mac || rest.length || !/^\d{4}(-(0[1-9]|1[0-2]))?$/.test(value)) return null
+  const expected = Buffer.from(sig(secret, value))
   const got = Buffer.from(mac)
   if (expected.length !== got.length || !timingSafeEqual(expected, got)) return null
+  const until = coarsen(value.length === 4 ? `${value}-01` : value)
   const nowYm = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`
-  return nowYm < month ? month : null
+  return nowYm < until ? until : null
 }
 
 export type SignupAnswers = { country?: unknown; region?: unknown; birthYear?: unknown; birthMonth?: unknown }
@@ -203,9 +214,20 @@ export async function applyAgeGate(payload: import('payload').Payload, args: { u
   const ok = (v?: string) => Boolean(v && /^\d{4}-(0[1-9]|1[0-2])$/.test(v))
   if (!ok(d.minorUntil) || (d.minorCap && !ok(d.minorCap))) throw new APIError('age-gate: minorUntil and minorCap must be YYYY-MM.', 500)
   const users = (payload.config.custom?.ageGate as { users?: string } | undefined)?.users ?? 'users'
-  await payload.update({ collection: users as never, id: args.userId, data: { minorUntil: d.minorUntil, minorCap: d.minorCap ?? d.minorUntil } as never, overrideAccess: true, req: args.req, context: { ageGate: true } })
   const onEvent = (payload.config.custom?.ageGateOnEvent as AgeGateOptions['onEvent']) ?? undefined
-  if (onEvent && args.req) await onEvent({ type: 'minor-set', user: String(args.userId), from: null, to: d.minorUntil, by: 'signup', req: args.req })
+  // With no `req` the plugin makes its own and opens a transaction on it, so the update and the host's `onEvent` (its
+  // audit entry) commit together or not at all. With a `req`, the caller owns the transaction and this joins it.
+  const own = !args.req
+  const req = args.req ?? ((await createLocalReq({}, payload)) as PayloadRequest)
+  const started = own ? await initTransaction(req) : false
+  try {
+    await payload.update({ collection: users as never, id: args.userId, data: { minorUntil: d.minorUntil, minorCap: d.minorCap ?? d.minorUntil } as never, overrideAccess: true, req, context: { ageGate: true } })
+    if (onEvent) await onEvent({ type: 'minor-set', user: String(args.userId), from: null, to: d.minorUntil, by: 'signup', req })
+    if (started) await commitTransaction(req)
+  } catch (e) {
+    if (started) await killTransaction(req)
+    throw e
+  }
 }
 
 /** For your own check outside sign-up (e.g. an invite form): throws a plain refusal when the answers aren't allowed. */
