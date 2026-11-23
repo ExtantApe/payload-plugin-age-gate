@@ -2,6 +2,12 @@
 
 Newest first.
 
+## 2026-11-22: year-level storage and the fail-closed audit (0.2.0)
+
+- Promises: minor status and the stay-blocked cookie hold only a year (always a January, never before the true majority or consent date), so no birth month can be worked back; old month values still read correctly and are rounded up when seen or saved; an old-format cookie that was edited or unsigned is refused; a missing or short secret is refused wherever a cookie is signed or checked; "not yet" never writes a month back to the field, the response or the audit; a failing audit leaves the account a minor and reports the failure; the update and its audit share one transaction.
+- Covered: `test/check.test.ts` (the January rules at every month and age, December and January births, coarsen on junk and twice over, old cookies, forged cookies, two cookies, secrets) and `test/plugin.test.ts` (the transaction cases, the failed audit, "not yet", the audit never carrying the old month, `coarsenStoredAges`).
+- Gaps skipped (and why): the docs-only CI gate is workflow plumbing, and 0.2.0 only changed version numbers.
+
 ## 2026-11-11: the stay-blocked cookie comes back as `setCookies`
 
 Suite: 20 tests before, 20 after (`npx vitest run`); one test changed. Prompted by Sign-up's combo test, which found the cookie never reached a response: the check wrote it to `req.responseHeaders` of a copy of the request.
